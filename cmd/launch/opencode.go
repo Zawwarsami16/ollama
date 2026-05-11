@@ -4,13 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/cmd/internal/fileutil"
@@ -24,6 +24,8 @@ import (
 type OpenCode struct {
 	configContent string // JSON config built by Edit, passed to Run via env var
 }
+
+const openCodeModelShowTimeout = 2 * time.Second
 
 func (o *OpenCode) String() string { return "OpenCode" }
 
@@ -181,6 +183,12 @@ func buildInlineConfig(primary string, models []string) (string, error) {
 	if primary == "" || len(models) == 0 {
 		return "", fmt.Errorf("buildInlineConfig: primary and models are required")
 	}
+
+	client, err := api.ClientFromEnvironment()
+	if err != nil {
+		client = nil
+	}
+
 	config := map[string]any{
 		"$schema": "https://opencode.ai/config.json",
 		"provider": map[string]any{
@@ -190,7 +198,7 @@ func buildInlineConfig(primary string, models []string) (string, error) {
 				"options": map[string]any{
 					"baseURL": envconfig.Host().String() + "/v1",
 				},
-				"models": buildModelEntries(models),
+				"models": buildModelEntries(context.Background(), client, models),
 			},
 		},
 		"model": "ollama/" + primary,
@@ -233,14 +241,25 @@ func readModelJSONModels() []string {
 	return models
 }
 
-func buildModelEntries(modelList []string) map[string]any {
-	client := api.NewClient(envconfig.Host(), http.DefaultClient)
-	ctx := context.Background()
-
+func buildModelEntries(ctx context.Context, client *api.Client, modelList []string) map[string]any {
 	models := make(map[string]any)
 	for _, model := range modelList {
 		entry := map[string]any{
 			"name": model,
+		}
+		if client != nil {
+			showCtx := ctx
+			var cancel context.CancelFunc
+			if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+				showCtx, cancel = context.WithTimeout(ctx, openCodeModelShowTimeout)
+			}
+
+			if resp, err := client.Show(showCtx, &api.ShowRequest{Model: model}); err == nil {
+				applyOpenCodeReasoning(resp, model, entry)
+			}
+			if cancel != nil {
+				cancel()
+			}
 		}
 		if isCloudModelName(model) {
 			if l, ok := lookupCloudModelLimit(model); ok {
@@ -250,7 +269,6 @@ func buildModelEntries(modelList []string) map[string]any {
 				}
 			}
 		}
-		applyOpenCodeReasoning(ctx, client, model, entry)
 		models[model] = entry
 	}
 	return models
@@ -265,16 +283,15 @@ func buildModelEntries(modelList []string) map[string]any {
 //     and adds a "none" variant so users can toggle thinking off via Ctrl+T.
 //
 // When the model does not support thinking, no reasoning config is set.
-func applyOpenCodeReasoning(ctx context.Context, client *api.Client, modelName string, entry map[string]any) {
-	resp, err := client.Show(ctx, &api.ShowRequest{Model: modelName})
-	if err != nil {
+func applyOpenCodeReasoning(resp *api.ShowResponse, modelName string, entry map[string]any) {
+	if resp == nil {
 		return
 	}
 
 	if slices.Contains(resp.Capabilities, modeltype.CapabilityThinking) {
 		entry["reasoning"] = true
 
-		if strings.Contains(modelName, "gpt-oss") {
+		if openCodeSupportsReasoningLevels(resp, modelName) {
 			// GPT-OSS models support variable thinking effort levels
 			// and cannot turn thinking off. Keep the built-in
 			// low/medium/high variants as-is and default to medium.
@@ -295,4 +312,21 @@ func applyOpenCodeReasoning(ctx context.Context, client *api.Client, modelName s
 			}
 		}
 	}
+}
+
+func openCodeSupportsReasoningLevels(resp *api.ShowResponse, modelName string) bool {
+	if resp != nil {
+		families := append([]string{resp.Details.Family}, resp.Details.Families...)
+		if arch, ok := resp.ModelInfo["general.architecture"].(string); ok {
+			families = append(families, arch)
+		}
+		for _, family := range families {
+			if family == "gptoss" || family == "gpt-oss" {
+				return true
+			}
+		}
+	}
+
+	// Fallback for older servers or sparse test responses that do not include family data.
+	return strings.Contains(modelName, "gpt-oss")
 }
